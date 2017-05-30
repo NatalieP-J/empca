@@ -34,6 +34,35 @@ from scipy.sparse import dia_matrix
 import scipy.sparse.linalg
 import math
 
+k = 1.4826 #scaling factor that makes MAD=variance in Gaussian case
+
+def MAD(arr):
+    """
+    An example function that can be used to calculate the variance using the
+    median absolute deviation
+     Inputs
+       - arr: a masked array with shape [nobs, nvar]
+     Outputs
+       - variance: a 1D scalar
+    
+    """
+    return k**2*N.ma.median((arr-N.ma.median(arr))**2)[0] 
+
+def meanMed(arr):
+    """                                                                        
+    An example function that can be used to calculate the variance using the   
+    median absolute deviation                                                  
+     Inputs                                                                    
+       - arr: a masked array with shape [nobs, nvar]                           
+     Outputs                                                                   
+       - variance: a 1D scalar
+    """
+
+    meds = N.ma.median(arr,axis=0)
+    medarr = N.tile(meds,(arr.shape[0],1))
+    medsub = N.ma.median((arr-medarr)**2,axis=0)
+    return k**2*N.ma.mean(medsub)
+    
 class Model(object):
     """
     A wrapper class for storing data, eigenvectors, and coefficients.
@@ -50,7 +79,7 @@ class Model(object):
     
     Not yet implemented: eigenvalues, mean subtraction/bookkeeping
     """
-    def __init__(self, eigvec, data, weights):
+    def __init__(self, eigvec, data, weights,varfunc=N.ma.var):
         """
         Create a Model object with eigenvectors, data, and weights.
         
@@ -62,7 +91,7 @@ class Model(object):
         """
         self.eigvec = eigvec
         self.nvec = eigvec.shape[0]
-        
+        self.varfunc = varfunc
         self.set_data(data, weights)
 
         
@@ -75,6 +104,12 @@ class Model(object):
         self.data = data
         self.weights = weights
 
+        self.weighted_data = self.data*self.weights
+        self.weighted_data[self.weighted_data!=0]/=N.sqrt(self.weights[self.weighted_data!=0]**2)
+        self.datamean = N.mean(self.weighted_data,axis=0)
+        self.data -= self.datamean
+        self.meanstack = N.tile(self.datamean,(self.data.shape[0],1))
+
         self.nobs = data.shape[0]
         self.nvar = data.shape[1]
         self.coeff = N.zeros( (self.nobs, self.nvec) )
@@ -86,11 +121,11 @@ class Model(object):
         
         #- Cache variance of unmasked data
         self._unmasked = ii
-        self._unmasked_data_var = N.var(self.data[ii])
-        self._unmasked_data_mad2 = N.sum(N.median(N.fabs(self.data[ii]\
-                                                      -N.median(self.data[ii])))**2.)
-                                         
+        self._unmasked_data_var = self.varfunc(self.mask_data(self.data))
         self.solve_coeffs()
+
+    def mask_data(self,arr):
+        return N.ma.masked_array(arr,mask=self.weights==0)
         
     def solve_coeffs(self):
         """
@@ -120,25 +155,25 @@ class Model(object):
         #- Solve the eigenvectors one by one
         for k in range(self.nvec):
 
-            #- Can we compact this loop into numpy matrix algebra?
-            c = self.coeff[:, k]
-            for j in range(self.nvar):
-                w = self.weights[:, j]
-                x = data[:, j]
-                # self.eigvec[k, j] = c.dot(w*x) / c.dot(w*c)
-                # self.eigvec[k, j] = w.dot(c*x) / w.dot(c*c)
-                cw = c*w
-                self.eigvec[k, j] = x.dot(cw) / c.dot(cw)
+            c = N.tile(self.coeff[:,k],(self.nvar,1)).T
+            cw = c*self.weights
+            numer = N.sum(data*cw,axis=0)
+            denom = N.sum(c*cw,axis=0)
+            self.eigvec[k] = numer/denom
+            
+
+            ##- Can we compact this loop into numpy matrix algebra?
+            #c = self.coeff[:, k]
+            #for j in range(self.nvar):
+            #    w = self.weights[:, j]
+            #    x = data[:, j]
+            #    cw = c*w
+            #    self.eigvec[k, j] = x.dot(cw) / c.dot(cw)
                                                 
             if smooth is not None:
                 self.eigvec[k] = smooth(self.eigvec[k])
 
             #- Remove this vector from the data before continuing with next
-            #? Alternate: Resolve for coefficients before subtracting?
-            #- Loop replaced with equivalent N.outer(c,v) call (faster)
-            # for i in range(self.nobs):
-            #     data[i] -= self.coeff[i,k] * self.eigvec[k]
-                                
             data -= N.outer(self.coeff[:,k], self.eigvec[k])    
 
         #- Renormalize and re-orthogonalize the answer
@@ -149,10 +184,38 @@ class Model(object):
                 self.eigvec[k] -=  c * self.eigvec[kx]
                     
             self.eigvec[k] /= norm(self.eigvec[k])
-        
+        self.rank_eigvec()
+
         #- Recalculate model
         self.solve_model()
            
+    def rank_eigvec(self):
+        """
+        Sort eigenvectors by the fraction of variance they explain.
+        """
+        vars = N.zeros(len(self.eigvec))
+        for i in range(len(self.eigvec)):
+            vars[i] = self.R2vec(i)
+        order = N.argsort(vars)[::-1]
+        self.eigvec = self.eigvec[order]
+        self.coeff = self.coeff.T[order].T
+
+    def check_orthogonality(self):
+        """
+        Check that all eigenvectors are orthogonal
+        """
+        # Create an array to hold results for pairs not including (i,i)
+        self.orthog_check = zeros(len(self.eigvec)**2-len(self.eigvec))
+        k = 0
+        pairs = []
+        for i in range(len(self.eigvec)):
+            for j in range(len(self.eigvec)):
+                if i!=j:
+                    self.orthog_check[k] = np.dot(self.eigvec[i],self.eigvec[j])
+                    self.orthog_check_pairs.append('({0},{1})'.format(i+1,j+1))
+                    k+=1
+        return np.sum(self.orthog_check)
+
     def solve_model(self):
         """
         Uses eigenvectors and coefficients to model data
@@ -173,36 +236,50 @@ class Model(object):
         """
         return self.chi2() / self.dof
         
-    def _model_vec(self, i):
+    def _model_vec(self, i, addmean=False):
         """Return the model using just eigvec i"""
-        return N.outer(self.coeff[:, i], self.eigvec[i])
+        if not addmean:
+            return N.outer(self.coeff[:, i], self.eigvec[i])
+        elif addmean:
+            return N.outer(self.coeff[:, i], self.eigvec[i])+self.meanstack
         
-    def R2vec(self, i,mad=False):
+    def eigval(self,nvec=None):
+
+        if nvec is None:
+            return 0
+        else:
+            mx = N.zeros(self.data.shape)
+            mx_1 = N.zeros(self.data.shape)
+            c = 0
+            for i in range(nvec):
+                mx += self._model_vec(i)
+                if c < nvec-1:
+                    mx_1 += self._model_vec(i)
+                c+=1
+            d = mx - self.data
+            d_1 = mx_1 - self.data
+            Vdatai = self.varfunc(self.mask_data(d))
+            Vdata_1 = self.varfunc(self.mask_data(d_1))
+            return Vdata_1-Vdatai
+
+    def R2vec(self, i):
         """
         Return fraction of data variance which is explained by vector i.
 
         Notes:
           - Does *not* correct for degrees of freedom.
-          - Not robust to data outliers.
         """
         
         d = self._model_vec(i) - self.data
-        if mad:
-            med= N.median(d[self._unmasked])
-            return 1.0 - \
-                N.sum(N.median(N.fabs(d-med)[self._unmasked])**2.)\
-                /self._unmasked_data_mad2
-        else:
-            return 1.0 - N.var(d[self._unmasked]) / self._unmasked_data_var
-        
-    def R2(self, nvec=None,mad=False):
+        return 1.0 - self.varfunc(self.mask_data(d))/self._unmasked_data_var
+                
+    def R2(self, nvec=None):
         """
         Return fraction of data variance which is explained by the first
         nvec vectors.  Default is R2 for all vectors.
         
         Notes:
           - Does *not* correct for degrees of freedom.
-          - Not robust to data outliers.
         """
         if nvec is None:
             mx = self.model
@@ -213,15 +290,9 @@ class Model(object):
             
         d = mx - self.data
 
-        #- Only consider R2 for unmasked data
-        if mad:
-            med= N.median(d[self._unmasked])
-            return 1.0 - \
-                N.sum(N.median(N.fabs(d-med)[self._unmasked])**2.)/\
-                self._unmasked_data_mad2        
-        else:
-            return 1.0 - N.var(d[self._unmasked]) / self._unmasked_data_var
-                
+        # Only consider R2 for unmasked data
+        return 1.0 - self.varfunc(self.mask_data(d))/self._unmasked_data_var         
+       
 def _random_orthonormal(nvec, nvar, seed=1):
     """
     Return array of random orthonormal vectors A[nvec, nvar] 
@@ -251,12 +322,6 @@ def _solve(A, b, w):
     b : 1D array length A.shape[0]
     w : 1D array same length as b
     """
-  
-    #- Apply weights
-    # nvar = len(w)
-    # W = dia_matrix((w, 0), shape=(nvar, nvar))
-    # bx = A.T.dot( W.dot(b) )
-    # Ax = A.T.dot( W.dot(A) )
     
     b = A.T.dot( w*b )
     A = A.T.dot( (A.T * w).T )
@@ -264,7 +329,6 @@ def _solve(A, b, w):
     if isinstance(A, scipy.sparse.spmatrix):
         x = scipy.sparse.linalg.spsolve(A, b)
     else:
-        # x = N.linalg.solve(A, b)
         x = N.linalg.lstsq(A, b)[0]
         
     return x
@@ -272,7 +336,7 @@ def _solve(A, b, w):
     
 #-------------------------------------------------------------------------
 
-def empca(data, weights=None, deltR2=0,niter=25, nvec=5, smooth=0, randseed=1, silent=False):
+def empca(data, weights=None, deltR2=0,niter=25, nvec=5, smooth=0, randseed=1, silent=False, varfunc=N.var):
     """
     Iteratively solve data[i] = Sum_j: c[i,j] p[j] using weights
     
@@ -286,6 +350,7 @@ def empca(data, weights=None, deltR2=0,niter=25, nvec=5, smooth=0, randseed=1, s
       - nvec     : number of model vectors
       - smooth   : smoothing length scale (0 for no smoothing)
       - randseed : random number generator seed; None to not re-initialize
+      - mad      : option to calculate R2 with median absolute deviation of data rather than variance
     
     Returns Model object
     """
@@ -309,7 +374,7 @@ def empca(data, weights=None, deltR2=0,niter=25, nvec=5, smooth=0, randseed=1, s
     #- Starting random guess
     eigvec = _random_orthonormal(nvec, nvar, seed=randseed)
     
-    model = Model(eigvec, data, weights)
+    model = Model(eigvec, data, weights,varfunc=varfunc)
     model.solve_coeffs()
     
     if not silent:
